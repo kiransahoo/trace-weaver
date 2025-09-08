@@ -1,0 +1,114 @@
+spring:
+  config:
+    import: optional:file:.env[.properties]  # ✅ Load .env file automatically
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+  # Spring AI Configuration
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+      base-url: https://api.openai.com
+      chat:
+        model: gpt-4
+        temperature: 0.7
+        max-tokens: 2000
+        options:
+          top-p: 1.0
+          frequency-penalty: 0.0
+          presence-penalty: 0.0
+
+server:
+  port: 6050
+
+proxy:
+  enabled: false
+  host:
+  port: 8080
+
+azure:
+  service-principal:
+    client-id: ${AZURE_CLIENT_ID}
+    client-secret: ${AZURE_CLIENT_SECRET}
+    tenant-id: ${AZURE_TENANT_ID}
+  monitor:
+    workspace-id: ${AZURE_WORKSPACE_ID}
+
+# GitHub configuration
+github:
+  owner: ${GITHUB_OWNER:kiransahoo}
+  repo: ${GITHUB_REPO:TraceWeaver}
+  branch: ${GITHUB_BRANCH:main}
+  token: ${GITHUB_TOKEN:}
+  project-path: otel-agent-with-custom/my-standalone-agent/trace-test
+
+  mappings:
+    - package-name: com.test
+      provider: github
+      owner: kiransahoo
+      repo: TraceWeaver
+      branch: main
+
+    - package-name: com.xx
+      provider: azure-devops
+      organization: xx
+      project: IT Claims
+      repo: xx
+      branch: master
+      token: ${AZURE_DEVOPS_PAT}
+
+    - package-name: com.xx.claims
+      provider: azure-devops
+      organization: xx
+      project: IT Claims
+      repo: xx
+      branch: master
+      token: ${AZURE_DEVOPS_PAT}
+
+    - package-name: com.tracebuddy
+      provider: github
+      owner: kiransahoo
+      repo: TraceWeaver
+      branch: main
+
+# Legacy OpenAI configuration (for your existing RestTemplate-based service)
+openai:
+  api:
+    key: ${OPENAI_API_KEY}
+    url: https://api.openai.com/v1/chat/completions
+
+# MCP Configuration with multiple source paths
+mcp:
+  enabled: true  # Set to true to enable MCP
+  base-path: /Users/kiransahoo/Desktop/code/otel-instrumentation/otel-agent-extension/otel-agent-with-custom/my-standalone-agent/trace-test  # Default to project root
+  timeout-seconds: 10
+  source: github
+  # Define multiple source paths relative to base-path
+  source-paths:
+    java: src/main/java
+    resources: src/main/resources
+    test: src/test/java
+    docs: docs
+    config: config
+
+logging:
+  level:
+    com.tracebuddy: DEBUG  # Changed from com.azureanalyzer
+    com.azure: INFO
+    org.springframework.ai: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+# TraceBuddy specific configuration (new addition for modular architecture)
+tracebuddy:
+  engine:
+    type: azure  # Options: azure, loki, jaeger
+
+# LLM Engine Configuration (new addition for modular LLM)
+llm:
+  engine:
+    type: openai  # Options: openai, claude, gemini, local
