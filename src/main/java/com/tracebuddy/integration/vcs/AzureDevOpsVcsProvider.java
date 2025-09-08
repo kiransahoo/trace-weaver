@@ -101,6 +101,7 @@ public class AzureDevOpsVcsProvider implements VcsProvider {
         // Try common paths first
         List<String> searchPaths = Arrays.asList(
                 "/src/main/java/" + expectedPath + "/" + fileName,
+                "/src/java/" + expectedPath + "/" + fileName,
                 "/src/test/java/" + expectedPath + "/" + fileName,
                 "/" + expectedPath + "/" + fileName,
                 "/" + fileName
