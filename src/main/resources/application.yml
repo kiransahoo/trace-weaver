@@ -7,7 +7,7 @@ spring:
   # Spring AI Configuration
   ai:
     openai:
-      api-key: ${OPENAI_API_KEY}
+      api-key: ${OPENAI_API_K}
       base-url: https://api.openai.com
       chat:
         model: gpt-4
@@ -17,10 +17,32 @@ spring:
           top-p: 1.0
           frequency-penalty: 0.0
           presence-penalty: 0.0
-
+  mail:
+    host: ${SMTP_HOST:smtp.office365.com}
+    port: ${SMTP_PORT:587}
+    username: ${SMTP_USERNAME}
+    password: ${SMTP_PASSWORD}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
+      mail.debug: false
 server:
   port: 6050
 
+# Alert Configuration
+alerts:
+  enabled: ${ALERTS_ENABLED:false}
+
+  email:
+    from: ${ALERT_FROM_EMAIL:alerts@tracebuddy.com}
+    fromName: ${ALERT_FROM_NAME:TraceBuddy Performance Monitor}
+
+  cooldown:
+    minutes: ${ALERT_COOLDOWN_MINUTES:30}
+
+  schedule:
+    check: "0 */15 * * * *"  # Check every 15 minutes
 proxy:
   enabled: false
   host:
@@ -39,7 +61,7 @@ github:
   owner: ${GITHUB_OWNER:kiransahoo}
   repo: ${GITHUB_REPO:TraceWeaver}
   branch: ${GITHUB_BRANCH:main}
-  token: ${GITHUB_TOKEN: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}
+  token: ${GITHUB_TOKE:}
   project-path: otel-agent-with-custom/my-standalone-agent/trace-test
 
   mappings:
@@ -48,6 +70,25 @@ github:
       owner: kiransahoo
       repo: TraceWeaver
       branch: main
+      alerts:
+        enabled: true
+        timeRange: "30m"  # Check last 30 minutes
+        durationThresholdMs: 1000  # Query threshold
+        recipients:
+          default:
+            - payments-team@company.com
+          critical:
+            - payments-oncall@company.com
+          slaBreachRecipients:
+            - payments-manager@company.com
+        sla:
+          criticalDurationMs: 5000    # Alert if avg > 5 seconds
+          highDurationMs: 2000         # Warning if avg > 2 seconds
+          criticalErrorRate: 0.1       # Alert if error rate > 10%
+          highErrorRate: 0.05          # Warning if error rate > 5%
+          percentile: 95               # Which percentile to check
+          percentileThresholdMs: 3000  # P95 should be under 3 seconds
+          minSampleSize: 10            # Don't alert on low volume
 
     - package-name: com.xx
       provider: azure-devops
