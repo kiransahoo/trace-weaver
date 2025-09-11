@@ -7,7 +7,7 @@ spring:
   # Spring AI Configuration
   ai:
     openai:
-      api-key: ${OPENAI_API_K}
+      api-key: ${OPENAI_API_KEY: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}
       base-url: https://api.openai.com
       chat:
         model: gpt-4
@@ -61,7 +61,7 @@ github:
   owner: ${GITHUB_OWNER:kiransahoo}
   repo: ${GITHUB_REPO:TraceWeaver}
   branch: ${GITHUB_BRANCH:main}
-  token: ${GITHUB_TOKE:}
+  token: ${GITHUB_TOKEN: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}
   project-path: otel-agent-with-custom/my-standalone-agent/trace-test
 
   mappings:

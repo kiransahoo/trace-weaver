@@ -70,75 +70,129 @@ public class TraceBuddyAlertService {
         try {
             TraceMonitorEngine engine = engineFactory.getEngine();
 
-            // Query traces using configured time range
-            List<TraceSpan> traces = engine.queryTracesWithAllFilters(
-                    mapping.getAlerts().getDurationThresholdMs(),
-                    mapping.getAlerts().getTimeRange(),
-                    null,  // resourceGroup
-                    null,  // instrumentationKey
+            // 1. Get aggregated metrics directly from Azure (FAST!)
+            Map<String, Object> metrics = engine.queryPackageMetricsForAlerts(
                     mapping.getCloudRoleName(),
-                    null,  // className
                     mapping.getPackageName(),
-                    true   // includeSubPackages
+                    mapping.getAlerts().getTimeRange(),
+                    mapping.getAlerts().getDurationThresholdMs(),
+                    mapping.getAlerts().getSla()
             );
 
-            if (traces.isEmpty()) {
-                log.debug("No traces found for {}", mapping.getPackageName());
+            if (metrics.isEmpty() || (Long) metrics.get("TotalCount") == 0) {
+                log.debug("No data found for {}", mapping.getPackageName());
                 return;
             }
 
-            // Calculate statistics
-            Map<String, Object> statistics = engine.calculateStatisticsFromTraces(traces);
+            // 2. Check SLA violations using metrics
+            List<SLAViolation> violations = checkViolationsFromMetrics(metrics, mapping.getAlerts().getSla());
 
-            // Detect hotspots
-            List<PerformanceHotspot> hotspots = hotspotDetectionService.detectHotspots(traces);
+            if (violations.isEmpty()) {
+                log.debug("No SLA violations for {}", mapping.getPackageName());
+                return;
+            }
 
-            // Get AI analysis for each hotspot and store separately
+            // 3. Only if there are violations, get the top slow operations
+            List<PerformanceHotspot> topHotspots = engine.queryTopSlowOperations(
+                    mapping.getCloudRoleName(),
+                    mapping.getPackageName(),
+                    mapping.getAlerts().getTimeRange(),
+                    mapping.getAlerts().getSla(),
+                    5  // Only get top 5
+            );
+
+            // 4. Get AI analysis only for these top operations
             Map<String, String> aiAnalysisMap = new HashMap<>();
-            for (PerformanceHotspot hotspot : hotspots.stream().limit(5).collect(Collectors.toList())) {
+            for (PerformanceHotspot hotspot : topHotspots) {
                 try {
-                    // Find slowest trace for this operation
-                    TraceSpan slowestTrace = traces.stream()
-                            .filter(t -> t.getOperationName().equals(hotspot.getOperation()))
-                            .max(Comparator.comparing(TraceSpan::getDurationMs))
-                            .orElse(null);
-
-                    // Get all traces for this operation
-                    List<TraceSpan> operationTraces = traces.stream()
-                            .filter(t -> t.getOperationName().equals(hotspot.getOperation()))
-                            .collect(Collectors.toList());
-
-                    // Call LLM analysis
-                    String analysis = llmAnalysisService.analyzeMethodPerformance(
+                    // Get a sample trace for this specific operation
+                    TraceSpan sampleTrace = engine.getSampleTraceForOperation(
                             hotspot.getOperation(),
-                            slowestTrace,
-                            operationTraces
+                            mapping.getCloudRoleName(),
+                            "5m"
                     );
 
-                    aiAnalysisMap.put(hotspot.getOperation(), analysis);
+                    if (sampleTrace != null) {
+                        String analysis = llmAnalysisService.analyzeMethodPerformance(
+                                hotspot.getOperation(),
+                                sampleTrace,
+                                null
+                        );
 
-                    // Extract recommendations from AI analysis and set them
-                    List<String> recommendations = extractRecommendations(analysis);
-                    hotspot.setRecommendations(recommendations);
+                        aiAnalysisMap.put(hotspot.getOperation(), analysis);
+                        hotspot.setRecommendations(extractRecommendations(analysis));
+                    } else {
+                        hotspot.setRecommendations(getDefaultRecommendations(hotspot));
+                    }
 
                 } catch (Exception e) {
-                    log.error("Failed to get AI analysis for {}", hotspot.getOperation(), e);
-                    // Set default recommendations
+                    log.error("Failed to analyze {}", hotspot.getOperation());
                     hotspot.setRecommendations(getDefaultRecommendations(hotspot));
                 }
             }
 
-            // Check SLA violations
-            List<SLAViolation> violations = checkViolations(statistics, hotspots, mapping.getAlerts().getSla());
-
-            // Determine if we should alert
-            if (!violations.isEmpty() && shouldAlert(mapping.getPackageName())) {
-                sendAlert(mapping, hotspots, aiAnalysisMap, statistics, violations);
+            // 5. Send alert if not in cooldown
+            if (shouldAlert(mapping.getPackageName())) {
+                sendAlert(mapping, topHotspots, aiAnalysisMap, metrics, violations);
             }
 
         } catch (Exception e) {
             log.error("Error in SLA check for {}: {}", mapping.getPackageName(), e.getMessage());
         }
+    }
+
+    private List<SLAViolation> checkViolationsFromMetrics(
+            Map<String, Object> metrics,
+            GitHubProperties.SLAConfig sla) {
+
+        List<SLAViolation> violations = new ArrayList<>();
+
+        // Check average duration
+        Double avgDuration = (Double) metrics.get("AvgDuration");
+        if (avgDuration != null && avgDuration > sla.getCriticalDurationMs()) {
+            violations.add(SLAViolation.builder()
+                    .type("AVG_RESPONSE_TIME")
+                    .severity("CRITICAL")
+                    .actualValue(avgDuration)
+                    .threshold(sla.getCriticalDurationMs().doubleValue())
+                    .message(String.format("Avg response time %.2fms exceeds critical threshold %dms",
+                            avgDuration, sla.getCriticalDurationMs()))
+                    .build());
+        }
+
+        // Check configured percentile
+        String percentileKey = "percentile" + sla.getPercentile();
+        Double percentileValue = (Double) metrics.get(percentileKey);
+        if (percentileValue != null && percentileValue > sla.getPercentileThresholdMs()) {
+            violations.add(SLAViolation.builder()
+                    .type("PERCENTILE_" + sla.getPercentile())
+                    .severity("HIGH")
+                    .actualValue(percentileValue)
+                    .threshold(sla.getPercentileThresholdMs().doubleValue())
+                    .message(String.format("P%d %.2fms exceeds threshold %dms",
+                            sla.getPercentile(), percentileValue, sla.getPercentileThresholdMs()))
+                    .build());
+        }
+
+        // Check error rate
+        Long total = (Long) metrics.get("TotalCount");
+        Long errors = (Long) metrics.get("ErrorCount");
+        if (total != null && errors != null && total > sla.getMinSampleSize()) {
+            double errorRate = (double) errors / total;
+
+            if (errorRate > sla.getCriticalErrorRate()) {
+                violations.add(SLAViolation.builder()
+                        .type("ERROR_RATE")
+                        .severity("CRITICAL")
+                        .actualValue(errorRate * 100)
+                        .threshold(sla.getCriticalErrorRate() * 100)
+                        .message(String.format("Error rate %.2f%% exceeds critical threshold %.2f%%",
+                                errorRate * 100, sla.getCriticalErrorRate() * 100))
+                        .build());
+            }
+        }
+
+        return violations;
     }
 
     private List<SLAViolation> checkViolations(Map<String, Object> stats,

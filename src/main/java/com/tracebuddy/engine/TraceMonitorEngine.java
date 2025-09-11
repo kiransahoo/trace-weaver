@@ -1,5 +1,6 @@
 package com.tracebuddy.engine;
 
+import com.tracebuddy.config.GitHubProperties;
 import com.tracebuddy.model.*;
 import java.util.List;
 import java.util.Map;
@@ -10,6 +11,7 @@ import java.util.Set;
  * Supports Azure Monitor, Loki, Jaeger, and other OTEL backends
  */
 public interface TraceMonitorEngine {
+
     
     // Core query methods
     List<TraceSpan> queryTraces(long durationThresholdMs, String timeRange);
@@ -35,6 +37,34 @@ public interface TraceMonitorEngine {
             String instrumentationKey, String cloudRoleName,
             String className, String packageName,
             boolean includeSubPackages);
+
+    /**
+     * Query aggregated metrics for a package for SLA monitoring
+     */
+    Map<String, Object> queryPackageMetricsForAlerts(
+            String cloudRoleName,
+            String packageName,
+            String timeRange,
+            Long durationThresholdMs,
+            GitHubProperties.SLAConfig slaConfig);
+
+    /**
+     * Query top slow operations for a package
+     */
+    List<PerformanceHotspot> queryTopSlowOperations(
+            String cloudRoleName,
+            String packageName,
+            String timeRange,
+            GitHubProperties.SLAConfig slaConfig,
+            int topN);
+
+    /**
+     * Get a sample trace for a specific operation for detailed analysis
+     */
+    TraceSpan getSampleTraceForOperation(
+            String operationName,
+            String cloudRoleName,
+            String timeRange);
     
     List<TraceSpan> queryMethodsWithErrors(String timeRange);
     

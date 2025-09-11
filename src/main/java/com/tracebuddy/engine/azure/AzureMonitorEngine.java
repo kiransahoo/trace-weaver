@@ -5,6 +5,7 @@ import com.azure.identity.*;
 import com.azure.monitor.query.LogsQueryClient;
 import com.azure.monitor.query.LogsQueryClientBuilder;
 import com.azure.monitor.query.models.*;
+import com.tracebuddy.config.GitHubProperties;
 import com.tracebuddy.engine.TraceMonitorEngine;
 import com.tracebuddy.model.*;
 import jakarta.annotation.PostConstruct;
@@ -13,6 +14,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -1215,6 +1217,366 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
         return traces;
     }
 
+    @Override
+    public Map<String, Object> queryPackageMetricsForAlerts(
+            String cloudRoleName,
+            String packageName,
+            String timeRange,
+            Long durationThresholdMs,
+            GitHubProperties.SLAConfig slaConfig) {
+
+        String whereClause = buildWhereClause(cloudRoleName, packageName);
+
+        String query = String.format("""
+            traces
+            | where timestamp > ago(%s)
+            %s
+            | summarize 
+                TotalCount = count(),
+                ErrorCount = countif(success == false),
+                AvgDuration = avg(duration),
+                P%d = percentile(duration, %d),
+                P99 = percentile(duration, 99),
+                MaxDuration = max(duration),
+                SlowRequests_Critical = countif(duration > %d),
+                SlowRequests_High = countif(duration > %d),
+                SlowRequests_Medium = countif(duration > %d)
+            """,
+                timeRange,
+                whereClause,
+                slaConfig.getPercentile(),
+                slaConfig.getPercentile(),
+                slaConfig.getCriticalDurationMs(),
+                slaConfig.getHighDurationMs(),
+                durationThresholdMs
+        );
+
+        try {
+            LogsQueryResult result = logsQueryClient.queryWorkspace(
+                    workspaceId,
+                    query,
+                    new QueryTimeInterval(Duration.ofHours(1))
+            );
+
+            return parseMetricsResult(result, slaConfig);
+
+        } catch (Exception e) {
+            log.error("Error querying package metrics for alerts: {}", e.getMessage(), e);
+            return new HashMap<>();
+        }
+    }
+
+    @Override
+    public List<PerformanceHotspot> queryTopSlowOperations(
+            String cloudRoleName,
+            String packageName,
+            String timeRange,
+            GitHubProperties.SLAConfig slaConfig,
+            int topN) {
+
+        String whereClause = buildWhereClause(cloudRoleName, packageName);
+
+        String query = String.format("""
+            traces
+            | where timestamp > ago(%s)
+            %s
+            | summarize 
+                AvgDuration = avg(duration),
+                MaxDuration = max(duration),
+                Count = count(),
+                ErrorCount = countif(success == false)
+                by operation_Name
+            | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
+            | where AvgDuration > %d or ErrorRate > %f
+            | top %d by AvgDuration desc
+            """,
+                timeRange,
+                whereClause,
+                slaConfig.getHighDurationMs(),
+                slaConfig.getHighErrorRate(),
+                topN
+        );
+
+        try {
+            LogsQueryResult result = logsQueryClient.queryWorkspace(
+                    workspaceId,
+                    query,
+                    new QueryTimeInterval(Duration.ofHours(1))
+            );
+
+            return parseHotspotsResult(result, slaConfig);
+
+        } catch (Exception e) {
+            log.error("Error querying top slow operations: {}", e.getMessage(), e);
+            return new ArrayList<>();
+        }
+    }
+
+    @Override
+    public TraceSpan getSampleTraceForOperation(
+            String operationName,
+            String cloudRoleName,
+            String timeRange) {
+
+        String query = String.format("""
+            traces
+            | where timestamp > ago(%s)
+            | where operation_Name == '%s'
+            %s
+            | top 1 by duration desc
+            | project 
+                timestamp,
+                operation_Name,
+                duration,
+                success,
+                resultCode,
+                cloud_RoleName,
+                customDimensions,
+                operation_Id
+            """,
+                timeRange,
+                operationName,
+                cloudRoleName != null ? String.format("| where cloud_RoleName == '%s'", cloudRoleName) : ""
+        );
+
+        try {
+            LogsQueryResult result = logsQueryClient.queryWorkspace(
+                    workspaceId,
+                    query,
+                    new QueryTimeInterval(Duration.ofMinutes(30))
+            );
+
+            if (result.getTable() != null && !result.getTable().getRows().isEmpty()) {
+                return mapRowToTraceSpan(result.getTable().getRows().get(0), result.getTable());
+            }
+        } catch (Exception e) {
+            log.error("Error getting sample trace for operation: {}", operationName, e);
+        }
+
+        return null;
+    }
+
+    // HELPER METHODS - ALL OF THEM
+
+    private String buildWhereClause(String cloudRoleName, String packageName) {
+        StringBuilder whereClause = new StringBuilder();
+
+        if (cloudRoleName != null && !cloudRoleName.isEmpty()) {
+            whereClause.append(String.format("| where cloud_RoleName == '%s'\n", cloudRoleName));
+        }
+
+        if (packageName != null && !packageName.isEmpty()) {
+            whereClause.append(String.format("| where operation_Name startswith '%s'\n", packageName));
+        }
+
+        return whereClause.toString();
+    }
+
+    private Map<String, Object> parseMetricsResult(LogsQueryResult result, GitHubProperties.SLAConfig slaConfig) {
+        Map<String, Object> metrics = new HashMap<>();
+
+        if (result.getTable() != null && !result.getTable().getRows().isEmpty()) {
+            LogsTable table = result.getTable();
+            LogsTableRow row = table.getRows().get(0);
+
+            // Get column indices
+            Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+            // Extract values
+            metrics.put("TotalCount", getValueAsLong(row, columnIndices, "TotalCount"));
+            metrics.put("ErrorCount", getValueAsLong(row, columnIndices, "ErrorCount"));
+            metrics.put("AvgDuration", getValueAsDouble(row, columnIndices, "AvgDuration"));
+            metrics.put("percentile" + slaConfig.getPercentile(),
+                    getValueAsDouble(row, columnIndices, "P" + slaConfig.getPercentile()));
+            metrics.put("percentile99", getValueAsDouble(row, columnIndices, "P99"));
+            metrics.put("MaxDuration", getValueAsDouble(row, columnIndices, "MaxDuration"));
+            metrics.put("SlowRequests_Critical", getValueAsLong(row, columnIndices, "SlowRequests_Critical"));
+            metrics.put("SlowRequests_High", getValueAsLong(row, columnIndices, "SlowRequests_High"));
+            metrics.put("SlowRequests_Medium", getValueAsLong(row, columnIndices, "SlowRequests_Medium"));
+        }
+
+        return metrics;
+    }
+
+    private List<PerformanceHotspot> parseHotspotsResult(LogsQueryResult result, GitHubProperties.SLAConfig slaConfig) {
+        List<PerformanceHotspot> hotspots = new ArrayList<>();
+
+        if (result.getTable() != null) {
+            LogsTable table = result.getTable();
+            Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+            for (LogsTableRow row : table.getRows()) {
+                String operationName = getValueAsString(row, columnIndices, "operation_Name");
+                Double avgDuration = getValueAsDouble(row, columnIndices, "AvgDuration");
+                Double maxDuration = getValueAsDouble(row, columnIndices, "MaxDuration");
+                Long count = getValueAsLong(row, columnIndices, "Count");
+                Double errorRate = getValueAsDouble(row, columnIndices, "ErrorRate");
+
+                // Determine severity
+                String severity = determineSeverity(avgDuration, errorRate, slaConfig);
+
+                PerformanceHotspot hotspot = PerformanceHotspot.builder()
+                        .operation(operationName)
+                        .avgDurationMs(avgDuration != null ? avgDuration : 0.0)
+                        .maxDurationMs(maxDuration != null ? maxDuration : 0.0)
+                        .occurrenceCount(count != null ? count.intValue() : 0)
+                        .errorRate(errorRate != null ? errorRate : 0.0)
+                        .severity(severity)
+                        .build();
+
+                hotspots.add(hotspot);
+            }
+        }
+
+        return hotspots;
+    }
+
+    private TraceSpan mapRowToTraceSpan(LogsTableRow row, LogsTable table) {
+        try {
+            Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+            // Extract custom dimensions if available
+            String customDims = getValueAsString(row, columnIndices, "customDimensions");
+            Map<String, String> customDimensions = parseCustomDimensions(customDims);
+
+            // Parse timestamp to LocalDateTime
+            String timestampStr = getValueAsString(row, columnIndices, "timestamp");
+            LocalDateTime timestamp = null;
+            if (timestampStr != null && !timestampStr.isEmpty()) {
+                try {
+                    timestamp = LocalDateTime.parse(timestampStr.replace(" ", "T"));
+                } catch (Exception e) {
+                    log.debug("Could not parse timestamp: {}", timestampStr);
+                }
+            }
+
+            // Build attributes map
+            Map<String, Object> attributes = new HashMap<>();
+            attributes.put("className", customDimensions.getOrDefault("ClassName", ""));
+            attributes.put("methodName", customDimensions.getOrDefault("MethodName", ""));
+            attributes.put("success", getValueAsBoolean(row, columnIndices, "success"));
+            attributes.put("resultCode", getValueAsString(row, columnIndices, "resultCode"));
+
+            // Determine status based on success field
+            Boolean success = getValueAsBoolean(row, columnIndices, "success");
+            String status = success ? "OK" : "ERROR";
+
+            return TraceSpan.builder()
+                    .traceId(getValueAsString(row, columnIndices, "operation_Id"))
+                    .spanId(customDimensions.getOrDefault("SpanId", ""))
+                    .parentSpanId(customDimensions.getOrDefault("ParentId", ""))
+                    .operationName(getValueAsString(row, columnIndices, "operation_Name"))
+                    .cloudRoleName(getValueAsString(row, columnIndices, "cloud_RoleName"))
+                    .cloudRoleInstance(getValueAsString(row, columnIndices, "cloud_RoleInstance"))
+                    .durationMs(getValueAsDouble(row, columnIndices, "duration"))
+                    .timestamp(timestamp)
+                    .status(status)
+                    .attributes(attributes)
+                    .build();
+        } catch (Exception e) {
+            log.error("Error mapping row to TraceSpan", e);
+            return null;
+        }
+    }
+    private Map<String, Integer> buildColumnIndicesMap(LogsTable table) {
+        Map<String, Integer> columnIndices = new HashMap<>();
+        for (int i = 0; i < table.getColumns().size(); i++) {
+            columnIndices.put(table.getColumns().get(i).getColumnName(), i);
+        }
+        return columnIndices;
+    }
+
+    private String getValueAsString(LogsTableRow row, Map<String, Integer> columnIndices, String columnName) {
+        Integer index = columnIndices.get(columnName);
+        if (index != null && index < row.getRow().size()) {
+            Object value = row.getRow().get(index);
+            if (value != null) {
+                return value.toString();
+            }
+        }
+        return "";
+    }
+
+    private Long getValueAsLong(LogsTableRow row, Map<String, Integer> columnIndices, String columnName) {
+        Integer index = columnIndices.get(columnName);
+        if (index != null && index < row.getRow().size()) {
+            Object value = row.getRow().get(index);
+            if (value != null && !value.toString().isEmpty()) {
+                try {
+                    return Long.parseLong(value.toString());
+                } catch (NumberFormatException e) {
+                    log.debug("Could not parse long value for column {}: {}", columnName, value);
+                }
+            }
+        }
+        return 0L;
+    }
+
+    private Double getValueAsDouble(LogsTableRow row, Map<String, Integer> columnIndices, String columnName) {
+        Integer index = columnIndices.get(columnName);
+        if (index != null && index < row.getRow().size()) {
+            Object value = row.getRow().get(index);
+            if (value != null && !value.toString().isEmpty()) {
+                try {
+                    return Double.parseDouble(value.toString());
+                } catch (NumberFormatException e) {
+                    log.debug("Could not parse double value for column {}: {}", columnName, value);
+                }
+            }
+        }
+        return 0.0;
+    }
+
+    private Boolean getValueAsBoolean(LogsTableRow row, Map<String, Integer> columnIndices, String columnName) {
+        Integer index = columnIndices.get(columnName);
+        if (index != null && index < row.getRow().size()) {
+            Object value = row.getRow().get(index);
+            if (value != null) {
+                String strValue = value.toString().toLowerCase();
+                return "true".equals(strValue) || "1".equals(strValue);
+            }
+        }
+        return false;
+    }
+
+    private Map<String, String> parseCustomDimensions(String customDims) {
+        Map<String, String> dimensions = new HashMap<>();
+        if (customDims != null && !customDims.isEmpty()) {
+            try {
+                // Parse JSON-like custom dimensions
+                // Format: {"key1":"value1","key2":"value2"}
+                customDims = customDims.replace("{", "").replace("}", "");
+                String[] pairs = customDims.split(",");
+                for (String pair : pairs) {
+                    String[] keyValue = pair.split(":");
+                    if (keyValue.length == 2) {
+                        String key = keyValue[0].replace("\"", "").trim();
+                        String value = keyValue[1].replace("\"", "").trim();
+                        dimensions.put(key, value);
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Could not parse custom dimensions: {}", customDims);
+            }
+        }
+        return dimensions;
+    }
+
+    private String determineSeverity(Double avgDuration, Double errorRate, GitHubProperties.SLAConfig slaConfig) {
+        if (avgDuration == null) avgDuration = 0.0;
+        if (errorRate == null) errorRate = 0.0;
+
+        if (avgDuration > slaConfig.getCriticalDurationMs() ||
+                errorRate > slaConfig.getCriticalErrorRate()) {
+            return "CRITICAL";
+        } else if (avgDuration > slaConfig.getHighDurationMs() ||
+                errorRate > slaConfig.getHighErrorRate()) {
+            return "HIGH";
+        } else {
+            return "MEDIUM";
+        }
+    }
+
     private Map<String, Object> parseStatistics(LogsQueryResult result) {
         Map<String, Object> stats = new HashMap<>();
 
@@ -1271,6 +1633,8 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
 
         return operation;
     }
+
+
 
     private void extractErrorInfo(String properties, Map<String, Integer> errorTypes, List<String> errorMessages) {
         try {
