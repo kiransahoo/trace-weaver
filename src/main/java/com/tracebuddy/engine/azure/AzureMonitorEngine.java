@@ -1225,25 +1225,31 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             Long durationThresholdMs,
             GitHubProperties.SLAConfig slaConfig) {
 
-        String whereClause = buildWhereClause(cloudRoleName, packageName);
+        StringBuilder whereClause = new StringBuilder();
+        if (cloudRoleName != null && !cloudRoleName.isEmpty()) {
+            whereClause.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
+        }
+        if (packageName != null && !packageName.isEmpty()) {
+            whereClause.append(String.format("| where Name startswith '%s'\n", packageName));
+        }
 
         String query = String.format("""
-            traces
-            | where timestamp > ago(%s)
-            %s
-            | summarize 
-                TotalCount = count(),
-                ErrorCount = countif(success == false),
-                AvgDuration = avg(duration),
-                P%d = percentile(duration, %d),
-                P99 = percentile(duration, 99),
-                MaxDuration = max(duration),
-                SlowRequests_Critical = countif(duration > %d),
-                SlowRequests_High = countif(duration > %d),
-                SlowRequests_Medium = countif(duration > %d)
-            """,
+        AppDependencies
+        | where TimeGenerated > ago(%s)
+        %s
+        | summarize 
+            TotalCount = count(),
+            ErrorCount = countif(Success == "False"),
+            AvgDuration = avg(todouble(DurationMs)),
+            P%d = percentile(todouble(DurationMs), %d),
+            P99 = percentile(todouble(DurationMs), 99),
+            MaxDuration = max(todouble(DurationMs)),
+            SlowRequests_Critical = countif(todouble(DurationMs) > %d),
+            SlowRequests_High = countif(todouble(DurationMs) > %d),
+            SlowRequests_Medium = countif(todouble(DurationMs) > %d)
+        """,
                 timeRange,
-                whereClause,
+                whereClause.toString(),
                 slaConfig.getPercentile(),
                 slaConfig.getPercentile(),
                 slaConfig.getCriticalDurationMs(),
@@ -1258,7 +1264,21 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
                     new QueryTimeInterval(Duration.ofHours(1))
             );
 
-            return parseMetricsResult(result, slaConfig);
+            Map<String, Object> metrics = new HashMap<>();
+            if (result.getTable() != null && !result.getTable().getRows().isEmpty()) {
+                LogsTable table = result.getTable();
+                LogsTableRow row = table.getRows().get(0);
+                Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+                metrics.put("TotalCount", getValueAsLong(row, columnIndices, "TotalCount"));
+                metrics.put("ErrorCount", getValueAsLong(row, columnIndices, "ErrorCount"));
+                metrics.put("AvgDuration", getValueAsDouble(row, columnIndices, "AvgDuration"));
+                metrics.put("percentile" + slaConfig.getPercentile(),
+                        getValueAsDouble(row, columnIndices, "P" + slaConfig.getPercentile()));
+                metrics.put("percentile99", getValueAsDouble(row, columnIndices, "P99"));
+                metrics.put("MaxDuration", getValueAsDouble(row, columnIndices, "MaxDuration"));
+            }
+            return metrics;
 
         } catch (Exception e) {
             log.error("Error querying package metrics for alerts: {}", e.getMessage(), e);
@@ -1274,24 +1294,30 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             GitHubProperties.SLAConfig slaConfig,
             int topN) {
 
-        String whereClause = buildWhereClause(cloudRoleName, packageName);
+        StringBuilder whereClause = new StringBuilder();
+        if (cloudRoleName != null && !cloudRoleName.isEmpty()) {
+            whereClause.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
+        }
+        if (packageName != null && !packageName.isEmpty()) {
+            whereClause.append(String.format("| where Name startswith '%s'\n", packageName));
+        }
 
         String query = String.format("""
-            traces
-            | where timestamp > ago(%s)
-            %s
-            | summarize 
-                AvgDuration = avg(duration),
-                MaxDuration = max(duration),
-                Count = count(),
-                ErrorCount = countif(success == false)
-                by operation_Name
-            | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
-            | where AvgDuration > %d or ErrorRate > %f
-            | top %d by AvgDuration desc
-            """,
+        AppDependencies
+        | where TimeGenerated > ago(%s)
+        %s
+        | summarize 
+            AvgDuration = avg(todouble(DurationMs)),
+            MaxDuration = max(todouble(DurationMs)),
+            Count = count(),
+            ErrorCount = countif(Success == "False")
+            by Name
+        | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
+        | where AvgDuration > %d or ErrorRate > %f
+        | top %d by AvgDuration desc
+        """,
                 timeRange,
-                whereClause,
+                whereClause.toString(),
                 slaConfig.getHighDurationMs(),
                 slaConfig.getHighErrorRate(),
                 topN
@@ -1304,7 +1330,42 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
                     new QueryTimeInterval(Duration.ofHours(1))
             );
 
-            return parseHotspotsResult(result, slaConfig);
+            List<PerformanceHotspot> hotspots = new ArrayList<>();
+            if (result.getTable() != null) {
+                LogsTable table = result.getTable();
+                Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+                for (LogsTableRow row : table.getRows()) {
+                    String operationName = getValueAsString(row, columnIndices, "Name");
+                    Double avgDuration = getValueAsDouble(row, columnIndices, "AvgDuration");
+                    Double maxDuration = getValueAsDouble(row, columnIndices, "MaxDuration");
+                    Long count = getValueAsLong(row, columnIndices, "Count");
+                    Double errorRate = getValueAsDouble(row, columnIndices, "ErrorRate");
+
+                    String severity = "MEDIUM";
+                    if (avgDuration != null && errorRate != null) {
+                        if (avgDuration > slaConfig.getCriticalDurationMs() ||
+                                errorRate > slaConfig.getCriticalErrorRate()) {
+                            severity = "CRITICAL";
+                        } else if (avgDuration > slaConfig.getHighDurationMs() ||
+                                errorRate > slaConfig.getHighErrorRate()) {
+                            severity = "HIGH";
+                        }
+                    }
+
+                    PerformanceHotspot hotspot = PerformanceHotspot.builder()
+                            .operation(operationName)
+                            .avgDurationMs(avgDuration != null ? avgDuration : 0.0)
+                            .maxDurationMs(maxDuration != null ? maxDuration : 0.0)
+                            .occurrenceCount(count != null ? count.intValue() : 0)
+                            .errorRate(errorRate != null ? errorRate : 0.0)
+                            .severity(severity)
+                            .build();
+
+                    hotspots.add(hotspot);
+                }
+            }
+            return hotspots;
 
         } catch (Exception e) {
             log.error("Error querying top slow operations: {}", e.getMessage(), e);
@@ -1319,24 +1380,27 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             String timeRange) {
 
         String query = String.format("""
-            traces
-            | where timestamp > ago(%s)
-            | where operation_Name == '%s'
-            %s
-            | top 1 by duration desc
-            | project 
-                timestamp,
-                operation_Name,
-                duration,
-                success,
-                resultCode,
-                cloud_RoleName,
-                customDimensions,
-                operation_Id
-            """,
+        AppDependencies
+        | where TimeGenerated > ago(%s)
+        | where Name == '%s'
+        %s
+        | extend duration_numeric = todouble(DurationMs)
+        | top 1 by duration_numeric desc
+        | project 
+            TimeGenerated,
+            Name,
+            DurationMs,
+            Success,
+            ResultCode,
+            AppRoleName,
+            AppRoleInstance,
+            OperationId,
+            Id,
+            ParentId
+        """,
                 timeRange,
                 operationName,
-                cloudRoleName != null ? String.format("| where cloud_RoleName == '%s'", cloudRoleName) : ""
+                cloudRoleName != null ? String.format("| where AppRoleName == '%s'", cloudRoleName) : ""
         );
 
         try {
@@ -1347,12 +1411,33 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             );
 
             if (result.getTable() != null && !result.getTable().getRows().isEmpty()) {
-                return mapRowToTraceSpan(result.getTable().getRows().get(0), result.getTable());
+                LogsTable table = result.getTable();
+                LogsTableRow row = table.getRows().get(0);
+                Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+                String timestampStr = getValueAsString(row, columnIndices, "TimeGenerated");
+                LocalDateTime timestamp = parseTimestamp(timestampStr);
+
+                Map<String, Object> attributes = new HashMap<>();
+                attributes.put("success", getValueAsString(row, columnIndices, "Success"));
+                attributes.put("resultCode", getValueAsString(row, columnIndices, "ResultCode"));
+
+                return TraceSpan.builder()
+                        .traceId(getValueAsString(row, columnIndices, "OperationId"))
+                        .spanId(getValueAsString(row, columnIndices, "Id"))
+                        .parentSpanId(getValueAsString(row, columnIndices, "ParentId"))
+                        .operationName(getValueAsString(row, columnIndices, "Name"))
+                        .cloudRoleName(getValueAsString(row, columnIndices, "AppRoleName"))
+                        .cloudRoleInstance(getValueAsString(row, columnIndices, "AppRoleInstance"))
+                        .durationMs(getValueAsDouble(row, columnIndices, "DurationMs"))
+                        .timestamp(timestamp)
+                        .status(getValueAsString(row, columnIndices, "Success").equals("True") ? "OK" : "ERROR")
+                        .attributes(attributes)
+                        .build();
             }
         } catch (Exception e) {
             log.error("Error getting sample trace for operation: {}", operationName, e);
         }
-
         return null;
     }
 
@@ -1862,6 +1947,20 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             }
         }
         return 0L;
+    }
+
+    // Add this helper method if not present
+    private LocalDateTime parseTimestamp(String timestampStr) {
+        if (timestampStr == null || timestampStr.isEmpty()) return null;
+        try {
+            if (timestampStr.contains("T")) {
+                return LocalDateTime.parse(timestampStr.substring(0, timestampStr.lastIndexOf('.')));
+            }
+            return LocalDateTime.parse(timestampStr.replace(" ", "T"));
+        } catch (Exception e) {
+            log.debug("Could not parse timestamp: {}", timestampStr);
+            return null;
+        }
     }
 
     private LocalDateTime parseTimestamp(List<LogsTableCell> cells, int index) {

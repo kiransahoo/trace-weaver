@@ -7,7 +7,7 @@ spring:
   # Spring AI Configuration
   ai:
     openai:
-      api-key: ${OPENAI_API_KEY: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}
+      api-key: ${OPENAI_API_KE}
       base-url: https://api.openai.com
       chat:
         model: gpt-4

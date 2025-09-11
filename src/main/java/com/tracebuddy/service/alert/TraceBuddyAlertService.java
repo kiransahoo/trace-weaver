@@ -62,7 +62,6 @@ public class TraceBuddyAlertService {
             }
         }
     }
-
     public void checkPackageSLA(GitHubProperties.PackageMapping mapping) {
         log.info("Checking SLA for: {} (TimeRange: {})",
                 mapping.getPackageName(), mapping.getAlerts().getTimeRange());
@@ -98,14 +97,13 @@ public class TraceBuddyAlertService {
                     mapping.getPackageName(),
                     mapping.getAlerts().getTimeRange(),
                     mapping.getAlerts().getSla(),
-                    5  // Only get top 5
+                    5
             );
 
             // 4. Get AI analysis only for these top operations
             Map<String, String> aiAnalysisMap = new HashMap<>();
             for (PerformanceHotspot hotspot : topHotspots) {
                 try {
-                    // Get a sample trace for this specific operation
                     TraceSpan sampleTrace = engine.getSampleTraceForOperation(
                             hotspot.getOperation(),
                             mapping.getCloudRoleName(),
@@ -141,6 +139,7 @@ public class TraceBuddyAlertService {
         }
     }
 
+    // ADD this new method
     private List<SLAViolation> checkViolationsFromMetrics(
             Map<String, Object> metrics,
             GitHubProperties.SLAConfig sla) {
@@ -165,7 +164,7 @@ public class TraceBuddyAlertService {
         Double percentileValue = (Double) metrics.get(percentileKey);
         if (percentileValue != null && percentileValue > sla.getPercentileThresholdMs()) {
             violations.add(SLAViolation.builder()
-                    .type("PERCENTILE_" + sla.getPercentile())
+                    .type("P" + sla.getPercentile())
                     .severity("HIGH")
                     .actualValue(percentileValue)
                     .threshold(sla.getPercentileThresholdMs().doubleValue())
