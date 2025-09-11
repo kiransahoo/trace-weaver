@@ -1216,7 +1216,6 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
 
         return traces;
     }
-
     @Override
     public Map<String, Object> queryPackageMetricsForAlerts(
             String cloudRoleName,
@@ -1225,67 +1224,92 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             Long durationThresholdMs,
             GitHubProperties.SLAConfig slaConfig) {
 
-        StringBuilder whereClause = new StringBuilder();
+        log.info("Building metrics query for cloudRole: {}, package: {}, timeRange: {}",
+                cloudRoleName, packageName, timeRange);
+
+        // Build query exactly like your working UI queries
+        StringBuilder query = new StringBuilder();
+        query.append("AppDependencies\n");
+        query.append(String.format("| where TimeGenerated > ago(%s)\n", timeRange));
+
+        // Add filters matching your existing pattern
         if (cloudRoleName != null && !cloudRoleName.isEmpty()) {
-            whereClause.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
-        }
-        if (packageName != null && !packageName.isEmpty()) {
-            whereClause.append(String.format("| where Name startswith '%s'\n", packageName));
+            query.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
         }
 
-        String query = String.format("""
-        AppDependencies
-        | where TimeGenerated > ago(%s)
-        %s
+        if (packageName != null && !packageName.isEmpty()) {
+            query.append(String.format("| where Name startswith '%s'\n", packageName));
+        }
+
+        // Filter out HTTP calls like your UI does
+        query.append("| where Name !startswith 'GET /'\n");
+        query.append("| where Name !startswith 'POST /'\n");
+        query.append("| where Name !startswith 'PUT /'\n");
+        query.append("| where Name !startswith 'DELETE /'\n");
+        query.append("| where Name !startswith 'HTTP'\n");
+
+        // Ensure it's a method call
+        query.append("| where (Name contains 'com.' or Name contains 'org.' or Name contains 'net.' or Name contains 'io.')\n");
+
+        // Now summarize - matching your existing pattern
+        query.append(String.format("""
         | summarize 
             TotalCount = count(),
             ErrorCount = countif(Success == "False"),
             AvgDuration = avg(todouble(DurationMs)),
             P%d = percentile(todouble(DurationMs), %d),
             P99 = percentile(todouble(DurationMs), 99),
-            MaxDuration = max(todouble(DurationMs)),
-            SlowRequests_Critical = countif(todouble(DurationMs) > %d),
-            SlowRequests_High = countif(todouble(DurationMs) > %d),
-            SlowRequests_Medium = countif(todouble(DurationMs) > %d)
+            MaxDuration = max(todouble(DurationMs))
         """,
-                timeRange,
-                whereClause.toString(),
                 slaConfig.getPercentile(),
-                slaConfig.getPercentile(),
-                slaConfig.getCriticalDurationMs(),
-                slaConfig.getHighDurationMs(),
-                durationThresholdMs
-        );
+                slaConfig.getPercentile()
+        ));
+
+        String finalQuery = query.toString();
+        log.info("Executing query:\n{}", finalQuery);
 
         try {
+            // Use the same parseTimeRange method you use elsewhere
+            QueryTimeInterval interval = parseTimeRange(timeRange);
+
             LogsQueryResult result = logsQueryClient.queryWorkspace(
                     workspaceId,
-                    query,
-                    new QueryTimeInterval(Duration.ofHours(1))
+                    finalQuery,
+                    interval
             );
 
-            Map<String, Object> metrics = new HashMap<>();
-            if (result.getTable() != null && !result.getTable().getRows().isEmpty()) {
-                LogsTable table = result.getTable();
-                LogsTableRow row = table.getRows().get(0);
-                Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+            log.info("Query completed successfully");
 
-                metrics.put("TotalCount", getValueAsLong(row, columnIndices, "TotalCount"));
-                metrics.put("ErrorCount", getValueAsLong(row, columnIndices, "ErrorCount"));
-                metrics.put("AvgDuration", getValueAsDouble(row, columnIndices, "AvgDuration"));
-                metrics.put("percentile" + slaConfig.getPercentile(),
-                        getValueAsDouble(row, columnIndices, "P" + slaConfig.getPercentile()));
-                metrics.put("percentile99", getValueAsDouble(row, columnIndices, "P99"));
-                metrics.put("MaxDuration", getValueAsDouble(row, columnIndices, "MaxDuration"));
+            // Parse exactly like your existing parseStatistics method
+            Map<String, Object> metrics = new HashMap<>();
+
+            if (result.getAllTables() != null && !result.getAllTables().isEmpty()) {
+                LogsTable table = result.getAllTables().get(0);
+
+                if (!table.getRows().isEmpty()) {
+                    LogsTableRow row = table.getRows().get(0);
+                    List<LogsTableCell> cells = row.getRow();
+
+                    // Use the same parsing pattern as your existing code
+                    metrics.put("TotalCount", getCellLongValue(cells, 0));
+                    metrics.put("ErrorCount", getCellLongValue(cells, 1));
+                    metrics.put("AvgDuration", getCellDoubleValue(cells, 2));
+                    metrics.put("percentile" + slaConfig.getPercentile(), getCellDoubleValue(cells, 3));
+                    metrics.put("percentile99", getCellDoubleValue(cells, 4));
+                    metrics.put("MaxDuration", getCellDoubleValue(cells, 5));
+
+                    log.info("Metrics: TotalCount={}, AvgDuration={}",
+                            metrics.get("TotalCount"), metrics.get("AvgDuration"));
+                }
             }
+
             return metrics;
 
         } catch (Exception e) {
-            log.error("Error querying package metrics for alerts: {}", e.getMessage(), e);
+            log.error("Error querying metrics: {}", e.getMessage(), e);
             return new HashMap<>();
         }
     }
-
     @Override
     public List<PerformanceHotspot> queryTopSlowOperations(
             String cloudRoleName,
@@ -1294,18 +1318,27 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             GitHubProperties.SLAConfig slaConfig,
             int topN) {
 
-        StringBuilder whereClause = new StringBuilder();
+        StringBuilder query = new StringBuilder();
+        query.append("AppDependencies\n");
+        query.append(String.format("| where TimeGenerated > ago(%s)\n", timeRange));
+
         if (cloudRoleName != null && !cloudRoleName.isEmpty()) {
-            whereClause.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
-        }
-        if (packageName != null && !packageName.isEmpty()) {
-            whereClause.append(String.format("| where Name startswith '%s'\n", packageName));
+            query.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
         }
 
-        String query = String.format("""
-        AppDependencies
-        | where TimeGenerated > ago(%s)
-        %s
+        if (packageName != null && !packageName.isEmpty()) {
+            query.append(String.format("| where Name startswith '%s.'\n", packageName));
+        }
+
+        // Same filters as UI
+        query.append("| where Name !startswith 'GET /'\n");
+        query.append("| where Name !startswith 'POST /'\n");
+        query.append("| where Name !startswith 'PUT /'\n");
+        query.append("| where Name !startswith 'DELETE /'\n");
+        query.append("| where Name !startswith 'HTTP'\n");
+        query.append("| where (Name contains 'com.' or Name contains 'org.' or Name contains 'net.' or Name contains 'io.')\n");
+
+        query.append(String.format("""
         | summarize 
             AvgDuration = avg(todouble(DurationMs)),
             MaxDuration = max(todouble(DurationMs)),
@@ -1316,17 +1349,16 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
         | where AvgDuration > %d or ErrorRate > %f
         | top %d by AvgDuration desc
         """,
-                timeRange,
-                whereClause.toString(),
                 slaConfig.getHighDurationMs(),
                 slaConfig.getHighErrorRate(),
                 topN
-        );
+        ));
+
 
         try {
             LogsQueryResult result = logsQueryClient.queryWorkspace(
                     workspaceId,
-                    query,
+                    String.valueOf(query),
                     new QueryTimeInterval(Duration.ofHours(1))
             );
 
