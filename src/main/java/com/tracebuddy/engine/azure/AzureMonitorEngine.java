@@ -1339,15 +1339,19 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
         query.append("| where (Name contains 'com.' or Name contains 'org.' or Name contains 'net.' or Name contains 'io.')\n");
 
         query.append(String.format("""
-        | summarize 
-            AvgDuration = avg(todouble(DurationMs)),
-            MaxDuration = max(todouble(DurationMs)),
-            Count = count(),
-            ErrorCount = countif(Success == "False")
-            by Name
-        | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
-        | top %d by AvgDuration desc
-        """, topN));
+    | summarize 
+        AvgDuration = avg(todouble(DurationMs)),
+        MaxDuration = max(todouble(DurationMs)),
+        Count = count(),
+        ErrorCount = countif(Success == "False")
+        by Name
+    | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
+    | where AvgDuration > %d or ErrorRate > %f
+    | order by AvgDuration desc
+    """,
+                slaConfig.getHighDurationMs(),  // Only return operations exceeding thresholds
+                slaConfig.getHighErrorRate()
+        ));
 
         log.info("Executing top operations query:\n{}", query.toString());
 
