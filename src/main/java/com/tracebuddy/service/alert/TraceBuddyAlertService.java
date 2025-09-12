@@ -69,7 +69,7 @@ public class TraceBuddyAlertService {
         try {
             TraceMonitorEngine engine = engineFactory.getEngine();
 
-            // 1. Get aggregated metrics directly from Azure (FAST!)
+            // 1. Get aggregated metrics
             Map<String, Object> metrics = engine.queryPackageMetricsForAlerts(
                     mapping.getCloudRoleName(),
                     mapping.getPackageName(),
@@ -78,65 +78,111 @@ public class TraceBuddyAlertService {
                     mapping.getAlerts().getSla()
             );
 
+            log.info("Metrics received: {}", metrics);
+
             if (metrics.isEmpty() || (Long) metrics.get("TotalCount") == 0) {
                 log.debug("No data found for {}", mapping.getPackageName());
                 return;
             }
 
-            // 2. Check SLA violations using metrics
+            // 2. Check violations
             List<SLAViolation> violations = checkViolationsFromMetrics(metrics, mapping.getAlerts().getSla());
+            log.info("Found {} violations", violations.size());
 
-            if (violations.isEmpty()) {
-                log.debug("No SLA violations for {}", mapping.getPackageName());
-                return;
-            }
-
-            // 3. Only if there are violations, get the top slow operations
+            // 3. Always get top operations for context (even without violations)
             List<PerformanceHotspot> topHotspots = engine.queryTopSlowOperations(
                     mapping.getCloudRoleName(),
                     mapping.getPackageName(),
                     mapping.getAlerts().getTimeRange(),
                     mapping.getAlerts().getSla(),
-                    5
+                    5  // Get top 5
             );
 
-            // 4. Get AI analysis only for these top operations
+            log.info("Found {} top operations", topHotspots.size());
+
+            // 4. Get AI analysis for top operations
             Map<String, String> aiAnalysisMap = new HashMap<>();
             for (PerformanceHotspot hotspot : topHotspots) {
                 try {
+                    log.info("Getting sample trace for: {}", hotspot.getOperation());
+
                     TraceSpan sampleTrace = engine.getSampleTraceForOperation(
                             hotspot.getOperation(),
                             mapping.getCloudRoleName(),
-                            "5m"
+                            mapping.getAlerts().getTimeRange()
                     );
 
                     if (sampleTrace != null) {
+                        log.info("Analyzing with LLM...");
                         String analysis = llmAnalysisService.analyzeMethodPerformance(
                                 hotspot.getOperation(),
                                 sampleTrace,
-                                null
+                                Collections.singletonList(sampleTrace)
                         );
-
                         aiAnalysisMap.put(hotspot.getOperation(), analysis);
                         hotspot.setRecommendations(extractRecommendations(analysis));
                     } else {
+                        log.warn("No sample trace found for {}", hotspot.getOperation());
+                        String defaultAnalysis = generateDefaultAnalysis(hotspot);
+                        aiAnalysisMap.put(hotspot.getOperation(), defaultAnalysis);
                         hotspot.setRecommendations(getDefaultRecommendations(hotspot));
                     }
-
                 } catch (Exception e) {
-                    log.error("Failed to analyze {}", hotspot.getOperation());
+                    log.error("Failed to analyze {}: {}", hotspot.getOperation(), e.getMessage());
+                    aiAnalysisMap.put(hotspot.getOperation(), "Analysis unavailable");
                     hotspot.setRecommendations(getDefaultRecommendations(hotspot));
                 }
             }
 
-            // 5. Send alert if not in cooldown
-            if (shouldAlert(mapping.getPackageName())) {
+            // 5. Send alert only if violations exist and not in cooldown
+            if (!violations.isEmpty() && shouldAlert(mapping.getPackageName())) {
+                log.info("Sending alert email...");
                 sendAlert(mapping, topHotspots, aiAnalysisMap, metrics, violations);
+            } else if (violations.isEmpty()) {
+                log.info("No violations detected, skipping alert");
+            } else {
+                log.info("Alert in cooldown period");
             }
 
         } catch (Exception e) {
-            log.error("Error in SLA check for {}: {}", mapping.getPackageName(), e.getMessage());
+            log.error("Error in checkPackageSLA", e);
+            e.printStackTrace();
         }
+    }
+
+    // Add this helper method
+    private String generateDefaultAnalysis(PerformanceHotspot hotspot) {
+        StringBuilder analysis = new StringBuilder();
+
+        analysis.append("Performance Profile:\n\n");
+
+        if (hotspot.getAvgDurationMs() > 2000) {
+            analysis.append("⚠️ This method is experiencing significant latency issues.\n\n");
+            analysis.append("Potential root causes:\n");
+            analysis.append("• Inefficient database queries or missing indexes\n");
+            analysis.append("• Synchronous external service calls\n");
+            analysis.append("• Large data processing operations\n");
+            analysis.append("• Resource contention or locking issues\n\n");
+            analysis.append("Immediate actions:\n");
+            analysis.append("• Add performance profiling to identify bottlenecks\n");
+            analysis.append("• Review database query execution plans\n");
+            analysis.append("• Consider implementing caching strategies\n");
+        } else if (hotspot.getAvgDurationMs() > 1000) {
+            analysis.append("This method shows moderate performance degradation.\n\n");
+            analysis.append("Optimization opportunities:\n");
+            analysis.append("• Implement result caching\n");
+            analysis.append("• Optimize data access patterns\n");
+            analysis.append("• Consider async processing where applicable\n");
+        }
+
+        if (hotspot.getErrorRate() > 0.05) {
+            analysis.append("\nReliability concerns detected (").append(String.format("%.1f%% error rate", hotspot.getErrorRate() * 100)).append("):\n");
+            analysis.append("• Implement retry logic with exponential backoff\n");
+            analysis.append("• Add circuit breaker pattern\n");
+            analysis.append("• Improve error handling and logging\n");
+        }
+
+        return analysis.toString();
     }
 
     // ADD this new method
@@ -331,26 +377,45 @@ public class TraceBuddyAlertService {
         html.append("<head>\n");
         html.append("<meta charset=\"UTF-8\">\n");
         html.append("<style>\n");
-        html.append("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #333; margin: 0; padding: 0; }\n");
-        html.append(".container { max-width: 800px; margin: 0 auto; }\n");
+        html.append("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #333; margin: 0; padding: 0; background: #f5f5f5; }\n");
+        html.append(".container { max-width: 900px; margin: 0 auto; background: white; }\n");
         html.append(".header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; }\n");
-        html.append(".header h1 { margin: 0 0 10px 0; font-size: 28px; }\n");
-        html.append(".header p { margin: 5px 0; opacity: 0.9; }\n");
-        html.append(".content { padding: 30px; background: #f8f9fa; }\n");
-        html.append(".section { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }\n");
+        html.append(".header h1 { margin: 0 0 10px 0; font-size: 24px; display: flex; align-items: center; }\n");
+        html.append(".header p { margin: 5px 0; opacity: 0.95; font-size: 14px; }\n");
+        html.append(".content { padding: 30px; }\n");
+        html.append(".section { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; border: 1px solid #e2e8f0; }\n");
         html.append(".violation { background: #fff5f5; border-left: 4px solid #e53e3e; padding: 15px; margin: 10px 0; border-radius: 4px; }\n");
-        html.append(".violation strong { color: #c53030; }\n");
-        html.append(".hotspot { background: white; border: 1px solid #e2e8f0; padding: 15px; margin: 15px 0; border-radius: 8px; }\n");
-        html.append(".hotspot h3 { margin-top: 0; color: #2d3748; }\n");
-        html.append(".recommendation { background: #f0fdf4; border-left: 3px solid #48bb78; padding: 10px; margin: 8px 0; border-radius: 4px; }\n");
+        html.append(".violation-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }\n");
+        html.append(".severity-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }\n");
+        html.append(".critical { background: #fed7d7; color: #c53030; }\n");
+        html.append(".high { background: #fed7e2; color: #97266d; }\n");
+        html.append(".medium { background: #feebc8; color: #c05621; }\n");
+
+        // Hotspot styles to match UI
+        html.append(".hotspot { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; margin-bottom: 20px; overflow: hidden; }\n");
+        html.append(".hotspot-header { background: white; padding: 15px 20px; border-bottom: 1px solid #dee2e6; display: flex; align-items: center; justify-content: space-between; }\n");
+        html.append(".hotspot-title { font-size: 14px; color: #212529; font-family: 'SF Mono', Monaco, monospace; word-break: break-all; margin: 0; }\n");
+        html.append(".hotspot-badge { padding: 4px 12px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }\n");
+        html.append(".hotspot-metrics { display: flex; padding: 15px 20px; gap: 30px; background: white; }\n");
+        html.append(".metric-item { flex: 1; }\n");
+        html.append(".metric-label { font-size: 12px; color: #6c757d; margin-bottom: 4px; }\n");
+        html.append(".metric-value { font-size: 16px; color: #212529; font-weight: 600; }\n");
+        html.append(".ai-analysis { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; margin: 15px; border-radius: 8px; }\n");
+        html.append(".ai-analysis h4 { margin: 0 0 12px 0; font-size: 14px; display: flex; align-items: center; gap: 8px; }\n");
+        html.append(".ai-analysis-content { font-size: 13px; line-height: 1.6; }\n");
+        html.append(".recommendations { background: #f0fdf4; border-left: 4px solid #48bb78; padding: 15px; margin: 15px; border-radius: 4px; }\n");
+        html.append(".recommendations h4 { margin: 0 0 10px 0; color: #22543d; font-size: 14px; }\n");
+        html.append(".recommendation-item { color: #2f855a; margin: 8px 0; padding-left: 20px; position: relative; font-size: 13px; }\n");
+        html.append(".recommendation-item:before { content: '→'; position: absolute; left: 0; }\n");
+
+        // Table styles
         html.append("table { width: 100%; border-collapse: collapse; }\n");
-        html.append("th { background: #f7fafc; padding: 12px; text-align: left; font-weight: 600; border-bottom: 2px solid #e2e8f0; }\n");
-        html.append("td { padding: 12px; border-bottom: 1px solid #e2e8f0; }\n");
+        html.append("th { background: #f7fafc; padding: 12px; text-align: left; font-weight: 600; font-size: 13px; color: #4a5568; }\n");
+        html.append("td { padding: 12px; border-top: 1px solid #e2e8f0; font-size: 14px; }\n");
         html.append(".status-ok { color: #48bb78; font-weight: 600; }\n");
         html.append(".status-warning { color: #ed8936; font-weight: 600; }\n");
         html.append(".status-critical { color: #e53e3e; font-weight: 600; }\n");
-        html.append(".footer { background: #2d3748; color: white; padding: 20px; text-align: center; }\n");
-        html.append(".footer a { color: #90cdf4; text-decoration: none; }\n");
+        html.append(".footer { background: #2d3748; color: white; padding: 20px; text-align: center; font-size: 12px; }\n");
         html.append("</style>\n");
         html.append("</head>\n");
         html.append("<body>\n");
@@ -371,14 +436,16 @@ public class TraceBuddyAlertService {
 
         // SLA Violations Section
         html.append("<div class=\"section\">\n");
-        html.append("<h2>🚨 SLA Violations Detected</h2>\n");
+        html.append("<h2 style=\"margin-top: 0; font-size: 18px;\">🚨 SLA Violations Detected</h2>\n");
         for (SLAViolation violation : violations) {
             html.append("<div class=\"violation\">\n");
-            html.append("<strong>").append(violation.getType()).append("</strong> ");
-            html.append("<span style=\"background: #fed7d7; color: #c53030; padding: 2px 8px; border-radius: 4px; font-size: 12px;\">")
-                    .append(violation.getSeverity()).append("</span><br>\n");
-            html.append("<div style=\"margin-top: 8px;\">").append(violation.getMessage()).append("</div>\n");
-            html.append("<div style=\"margin-top: 5px; font-size: 14px; color: #718096;\">");
+            html.append("<div class=\"violation-header\">\n");
+            html.append("<strong>").append(violation.getType()).append("</strong>\n");
+            html.append("<span class=\"severity-badge ").append(violation.getSeverity().toLowerCase()).append("\">")
+                    .append(violation.getSeverity()).append("</span>\n");
+            html.append("</div>\n");
+            html.append("<div>").append(violation.getMessage()).append("</div>\n");
+            html.append("<div style=\"margin-top: 8px; font-size: 13px; color: #718096;\">");
             html.append("Actual: <strong>").append(String.format("%.2f", violation.getActualValue())).append("</strong> | ");
             html.append("Threshold: <strong>").append(String.format("%.2f", violation.getThreshold())).append("</strong>");
             html.append("</div>\n");
@@ -388,7 +455,7 @@ public class TraceBuddyAlertService {
 
         // Current Metrics Section
         html.append("<div class=\"section\">\n");
-        html.append("<h2>📊 Current Performance Metrics</h2>\n");
+        html.append("<h2 style=\"margin-top: 0; font-size: 18px;\">📊 Current Performance Metrics</h2>\n");
         html.append("<table>\n");
         html.append("<thead>\n");
         html.append("<tr><th>Metric</th><th>Value</th><th>Status</th></tr>\n");
@@ -396,7 +463,8 @@ public class TraceBuddyAlertService {
         html.append("<tbody>\n");
 
         // Average Duration
-        Double avgDuration = (Double) statistics.get("avgDuration");
+        Double avgDuration = (Double) statistics.get("AvgDuration");
+        if (avgDuration == null) avgDuration = (Double) statistics.get("avgDuration");
         html.append("<tr>\n");
         html.append("<td>Average Duration</td>\n");
         html.append("<td>").append(String.format("%.2f ms", avgDuration)).append("</td>\n");
@@ -411,111 +479,131 @@ public class TraceBuddyAlertService {
         html.append("</td>\n</tr>\n");
 
         // P95 Duration
-        Double p95 = (Double) statistics.get("percentile95");
-        html.append("<tr>\n");
-        html.append("<td>P95 Duration</td>\n");
-        html.append("<td>").append(String.format("%.2f ms", p95)).append("</td>\n");
-        html.append("<td class=\"");
-        if (p95 > mapping.getAlerts().getSla().getPercentileThresholdMs()) {
-            html.append("status-critical\">❌ EXCEEDED");
-        } else {
-            html.append("status-ok\">✅ OK");
+        String p95Key = "percentile" + mapping.getAlerts().getSla().getPercentile();
+        Double p95 = (Double) statistics.get(p95Key);
+        if (p95 == null) p95 = (Double) statistics.get("percentile95");
+        if (p95 != null) {
+            html.append("<tr>\n");
+            html.append("<td>P95 Duration</td>\n");
+            html.append("<td>").append(String.format("%.2f ms", p95)).append("</td>\n");
+            html.append("<td class=\"status-ok\">✅ OK</td>\n");
+            html.append("</tr>\n");
         }
-        html.append("</td>\n</tr>\n");
 
         // Error Rate
-        Long errorCount = (Long) statistics.get("errorCount");
-        Long totalCount = (Long) statistics.get("totalCount");
-        double errorRate = totalCount > 0 ? (double) errorCount / totalCount * 100 : 0;
+        Long errorCount = (Long) statistics.get("ErrorCount");
+        if (errorCount == null) errorCount = (Long) statistics.get("errorCount");
+        Long totalCount = (Long) statistics.get("TotalCount");
+        if (totalCount == null) totalCount = (Long) statistics.get("totalCount");
+
+        double errorRate = (totalCount != null && totalCount > 0) ?
+                ((double) errorCount / totalCount * 100) : 0;
         html.append("<tr>\n");
         html.append("<td>Error Rate</td>\n");
         html.append("<td>").append(String.format("%.2f%%", errorRate)).append("</td>\n");
-        html.append("<td class=\"");
-        if (errorRate > mapping.getAlerts().getSla().getCriticalErrorRate() * 100) {
-            html.append("status-critical\">❌ HIGH");
-        } else {
-            html.append("status-ok\">✅ OK");
-        }
-        html.append("</td>\n</tr>\n");
+        html.append("<td class=\"status-ok\">✅ OK</td>\n");
+        html.append("</tr>\n");
 
-        // Total Requests
         html.append("<tr>\n");
         html.append("<td>Total Requests</td>\n");
         html.append("<td>").append(totalCount).append("</td>\n");
         html.append("<td>-</td>\n");
         html.append("</tr>\n");
 
-        // P99 if available
-        Double p99 = (Double) statistics.get("percentile99");
-        if (p99 != null) {
-            html.append("<tr>\n");
-            html.append("<td>P99 Duration</td>\n");
-            html.append("<td>").append(String.format("%.2f ms", p99)).append("</td>\n");
-            html.append("<td>-</td>\n");
-            html.append("</tr>\n");
-        }
-
         html.append("</tbody>\n");
         html.append("</table>\n");
         html.append("</div>\n");
 
-        // Top Performance Hotspots
-        html.append("<div class=\"section\">\n");
-        html.append("<h2>🔥 Top Performance Hotspots</h2>\n");
+        // Performance Hotspots Section - Matching UI exactly
+        if (hotspots != null && !hotspots.isEmpty()) {
+            html.append("<div class=\"section\">\n");
+            html.append("<h2 style=\"margin-top: 0; font-size: 18px;\">🔥 Performance Hotspots</h2>\n");
 
-        int count = 0;
-        for (PerformanceHotspot hotspot : hotspots) {
-            if (++count > 5) break;
-
-            html.append("<div class=\"hotspot\">\n");
-            html.append("<h3>").append(hotspot.getOperation()).append("</h3>\n");
-
-            // Severity badge
-            String severityColor = "CRITICAL".equals(hotspot.getSeverity()) ? "#e53e3e" :
-                    "HIGH".equals(hotspot.getSeverity()) ? "#ed8936" : "#3182ce";
-            html.append("<span style=\"background: ").append(severityColor).append("; color: white; padding: 4px 12px; border-radius: 4px; font-size: 12px;\">")
-                    .append(hotspot.getSeverity() != null ? hotspot.getSeverity() : "MEDIUM")
-                    .append("</span>\n");
-
-            // Metrics table
-            html.append("<table style=\"margin-top: 15px;\">\n");
-            html.append("<tr><td style=\"width: 150px;\"><strong>Avg Duration:</strong></td><td>")
-                    .append(String.format("%.2f ms", hotspot.getAvgDurationMs())).append("</td></tr>\n");
-            html.append("<tr><td><strong>Max Duration:</strong></td><td>")
-                    .append(String.format("%.2f ms", hotspot.getMaxDurationMs())).append("</td></tr>\n");
-            html.append("<tr><td><strong>Occurrences:</strong></td><td>")
-                    .append(hotspot.getOccurrenceCount()).append("</td></tr>\n");
-            html.append("<tr><td><strong>Error Rate:</strong></td><td>")
-                    .append(String.format("%.2f%%", hotspot.getErrorRate() * 100)).append("</td></tr>\n");
-            html.append("</table>\n");
-
-            // AI Recommendations
-            if (hotspot.getRecommendations() != null && !hotspot.getRecommendations().isEmpty()) {
-                html.append("<div style=\"margin-top: 15px;\">\n");
-                html.append("<h4 style=\"margin-bottom: 10px;\">🤖 AI Recommendations:</h4>\n");
-                for (String rec : hotspot.getRecommendations()) {
-                    html.append("<div class=\"recommendation\">• ").append(rec).append("</div>\n");
+            for (PerformanceHotspot hotspot : hotspots) {
+                // Determine severity
+                String severity = "MEDIUM";
+                String badgeColor = "#ffc107";
+                if (hotspot.getAvgDurationMs() > 2000) {
+                    severity = "CRITICAL";
+                    badgeColor = "#dc3545";
+                } else if (hotspot.getAvgDurationMs() > 1000) {
+                    severity = "HIGH";
+                    badgeColor = "#fd7e14";
                 }
+
+                html.append("<div class=\"hotspot\">\n");
+
+                // Header with method name and severity badge
+                html.append("<div class=\"hotspot-header\">\n");
+                html.append("<h3 class=\"hotspot-title\">").append(hotspot.getOperation()).append("</h3>\n");
+                html.append("<span class=\"hotspot-badge\" style=\"background: ").append(badgeColor)
+                        .append("; color: white;\">").append(severity).append("</span>\n");
                 html.append("</div>\n");
+
+                // Metrics row matching UI
+                html.append("<div class=\"hotspot-metrics\">\n");
+
+                html.append("<div class=\"metric-item\">\n");
+                html.append("<div class=\"metric-label\">Avg</div>\n");
+                html.append("<div class=\"metric-value\">").append(String.format("%.2fs", hotspot.getAvgDurationMs() / 1000.0)).append("</div>\n");
+                html.append("</div>\n");
+
+                html.append("<div class=\"metric-item\">\n");
+                html.append("<div class=\"metric-label\">Max</div>\n");
+                html.append("<div class=\"metric-value\">").append(String.format("%.2fs", hotspot.getMaxDurationMs() / 1000.0)).append("</div>\n");
+                html.append("</div>\n");
+
+                html.append("<div class=\"metric-item\">\n");
+                html.append("<div class=\"metric-label\">Count</div>\n");
+                html.append("<div class=\"metric-value\">").append(hotspot.getOccurrenceCount()).append("</div>\n");
+                html.append("</div>\n");
+
+                html.append("<div class=\"metric-item\">\n");
+                html.append("<div class=\"metric-label\">Error Rate</div>\n");
+                html.append("<div class=\"metric-value\">").append(String.format("%.1f%%", hotspot.getErrorRate() * 100)).append("</div>\n");
+                html.append("</div>\n");
+
+                html.append("</div>\n");
+
+                // AI Analysis Section - Like "Analyze Code" button results
+                String analysis = aiAnalysisMap.get(hotspot.getOperation());
+                if (analysis != null && !analysis.isEmpty()) {
+                    html.append("<div class=\"ai-analysis\">\n");
+                    html.append("<h4>🤖 Code Analysis</h4>\n");
+                    html.append("<div class=\"ai-analysis-content\">\n");
+
+                    String[] lines = analysis.split("\n");
+                    for (String line : lines) {
+                        if (!line.trim().isEmpty()) {
+                            html.append("<p style=\"margin: 8px 0;\">").append(line).append("</p>\n");
+                        }
+                    }
+
+                    html.append("</div>\n");
+                    html.append("</div>\n");
+                }
+
+                // Recommendations section
+                if (hotspot.getRecommendations() != null && !hotspot.getRecommendations().isEmpty()) {
+                    html.append("<div class=\"recommendations\">\n");
+                    html.append("<h4>✅ Recommended Actions</h4>\n");
+                    for (String rec : hotspot.getRecommendations()) {
+                        html.append("<div class=\"recommendation-item\">").append(rec).append("</div>\n");
+                    }
+                    html.append("</div>\n");
+                }
+
+                html.append("</div>\n"); // end hotspot
             }
 
-            html.append("</div>\n");
+            html.append("</div>\n"); // end section
         }
-        html.append("</div>\n");
 
         html.append("</div>\n"); // close content
 
         // Footer
         html.append("<div class=\"footer\">\n");
-        if (mapping.getRepo() != null) {
-            html.append("<p>Repository: ");
-            if (mapping.getOwner() != null) {
-                html.append(mapping.getOwner()).append("/");
-            }
-            html.append(mapping.getRepo());
-            html.append(" (").append(mapping.getBranch()).append(")</p>\n");
-        }
-        html.append("<p style=\"margin-top: 10px; font-size: 14px; opacity: 0.8;\">Generated by TraceBuddy Performance Monitor</p>\n");
+        html.append("<p>Generated by TraceBuddy Performance Monitor</p>\n");
         html.append("</div>\n");
 
         html.append("</div>\n"); // close container
@@ -524,7 +612,6 @@ public class TraceBuddyAlertService {
 
         return html.toString();
     }
-
 
     private List<String> extractRecommendations(String analysis) {
         List<String> recommendations = new ArrayList<>();

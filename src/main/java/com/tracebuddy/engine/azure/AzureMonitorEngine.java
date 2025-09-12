@@ -1327,7 +1327,7 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
         }
 
         if (packageName != null && !packageName.isEmpty()) {
-            query.append(String.format("| where Name startswith '%s.'\n", packageName));
+            query.append(String.format("| where Name startswith '%s.'\n", packageName)); // WITH DOT
         }
 
         // Same filters as UI
@@ -1346,44 +1346,40 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             ErrorCount = countif(Success == "False")
             by Name
         | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
-        | where AvgDuration > %d or ErrorRate > %f
         | top %d by AvgDuration desc
-        """,
-                slaConfig.getHighDurationMs(),
-                slaConfig.getHighErrorRate(),
-                topN
-        ));
+        """, topN));
 
+        log.info("Executing top operations query:\n{}", query.toString());
 
         try {
+            QueryTimeInterval interval = parseTimeRange(timeRange);
             LogsQueryResult result = logsQueryClient.queryWorkspace(
                     workspaceId,
-                    String.valueOf(query),
-                    new QueryTimeInterval(Duration.ofHours(1))
+                    query.toString(),
+                    interval
             );
 
             List<PerformanceHotspot> hotspots = new ArrayList<>();
-            if (result.getTable() != null) {
-                LogsTable table = result.getTable();
-                Map<String, Integer> columnIndices = buildColumnIndicesMap(table);
+
+            if (result.getAllTables() != null && !result.getAllTables().isEmpty()) {
+                LogsTable table = result.getAllTables().get(0);
+
+                log.info("Got {} rows from top operations query", table.getRows().size());
 
                 for (LogsTableRow row : table.getRows()) {
-                    String operationName = getValueAsString(row, columnIndices, "Name");
-                    Double avgDuration = getValueAsDouble(row, columnIndices, "AvgDuration");
-                    Double maxDuration = getValueAsDouble(row, columnIndices, "MaxDuration");
-                    Long count = getValueAsLong(row, columnIndices, "Count");
-                    Double errorRate = getValueAsDouble(row, columnIndices, "ErrorRate");
+                    List<LogsTableCell> cells = row.getRow();
 
-                    String severity = "MEDIUM";
-                    if (avgDuration != null && errorRate != null) {
-                        if (avgDuration > slaConfig.getCriticalDurationMs() ||
-                                errorRate > slaConfig.getCriticalErrorRate()) {
-                            severity = "CRITICAL";
-                        } else if (avgDuration > slaConfig.getHighDurationMs() ||
-                                errorRate > slaConfig.getHighErrorRate()) {
-                            severity = "HIGH";
-                        }
-                    }
+                    // Parse in the correct order based on query
+                    String operationName = getCellStringValue(cells, 0); // Name
+                    Double avgDuration = getCellDoubleValue(cells, 1);   // AvgDuration
+                    Double maxDuration = getCellDoubleValue(cells, 2);   // MaxDuration
+                    Long count = getCellLongValue(cells, 3);            // Count
+                    Long errorCount = getCellLongValue(cells, 4);        // ErrorCount
+                    Double errorRate = getCellDoubleValue(cells, 5);     // ErrorRate
+
+                    // Match UI severity logic
+                    String severity = determineSeverity(avgDuration, errorRate, slaConfig);
+
 
                     PerformanceHotspot hotspot = PerformanceHotspot.builder()
                             .operation(operationName)
@@ -1395,12 +1391,16 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
                             .build();
 
                     hotspots.add(hotspot);
+                    log.info("Added hotspot: {} (Avg: {}ms, Count: {})",
+                            operationName, avgDuration, count);
                 }
             }
+
+            log.info("Returning {} hotspots", hotspots.size());
             return hotspots;
 
         } catch (Exception e) {
-            log.error("Error querying top slow operations: {}", e.getMessage(), e);
+            log.error("Error querying top slow operations", e);
             return new ArrayList<>();
         }
     }
