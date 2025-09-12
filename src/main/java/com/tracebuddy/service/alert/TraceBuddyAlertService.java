@@ -70,97 +70,93 @@ public class TraceBuddyAlertService {
             TraceMonitorEngine engine = engineFactory.getEngine();
             GitHubProperties.SLAConfig sla = mapping.getAlerts().getSla();
 
-            // 1. Get aggregated metrics
-            Map<String, Object> metrics = engine.queryPackageMetricsForAlerts(
-                    mapping.getCloudRoleName(),
-                    mapping.getPackageName(),
-                    mapping.getAlerts().getTimeRange(),
+            // 1. Get traces using EXISTING UI METHOD
+            List<TraceSpan> traces = engine.queryTracesWithAllFilters(
                     mapping.getAlerts().getDurationThresholdMs(),
-                    sla
+                    mapping.getAlerts().getTimeRange(),
+                    null,  // resourceGroup
+                    null,  // instrumentationKey
+                    mapping.getCloudRoleName(),
+                    null,  // className
+                    mapping.getPackageName(),
+                    true   // includeSubPackages
             );
 
-            if (metrics.isEmpty() || (Long) metrics.get("TotalCount") == 0) {
-                log.debug("No data found for {}", mapping.getPackageName());
+            if (traces.isEmpty()) {
+                log.info("No traces found for {}", mapping.getPackageName());
                 return;
             }
 
-            // 2. Get top slow operations (hotspots)
-            List<PerformanceHotspot> topHotspots = engine.queryTopSlowOperations(
-                    mapping.getCloudRoleName(),
-                    mapping.getPackageName(),
-                    mapping.getAlerts().getTimeRange(),
-                    sla,
-                    5
-            );
+            log.info("Found {} traces", traces.size());
 
-            log.info("Found {} hotspots", topHotspots.size());
+            // 2. Calculate statistics using EXISTING UI METHOD
+            Map<String, Object> statistics = engine.calculateStatisticsFromTraces(traces);
 
-            // 3. If hotspots exist, analyze them and send alert
-            if (!topHotspots.isEmpty() && shouldAlert(mapping.getPackageName())) {
+            // 3. Detect hotspots using EXISTING SERVICE
+            List<PerformanceHotspot> hotspots = hotspotDetectionService.detectHotspots(traces);
 
-                // Build violations from hotspots
-                List<SLAViolation> violations = new ArrayList<>();
+            // Limit to top N if configured
+            if (hotspots.size() > 10) {
+                hotspots = hotspots.stream()
+                        .sorted((a, b) -> Double.compare(b.getAvgDurationMs(), a.getAvgDurationMs()))
+                        .limit(10)
+                        .collect(Collectors.toList());
+            }
 
-                // Check each hotspot against SLA thresholds
-                for (PerformanceHotspot hotspot : topHotspots) {
-                    if (hotspot.getAvgDurationMs() > sla.getCriticalDurationMs()) {
-                        violations.add(SLAViolation.builder()
-                                .type("SLOW_METHOD")
-                                .severity("CRITICAL")
-                                .actualValue(hotspot.getAvgDurationMs())
-                                .threshold(sla.getCriticalDurationMs().doubleValue())
-                                .message(String.format("%s exceeds critical threshold (%.2fs > %.2fs)",
-                                        getShortMethodName(hotspot.getOperation()),
-                                        hotspot.getAvgDurationMs() / 1000.0,
-                                        sla.getCriticalDurationMs() / 1000.0))
-                                .build());
-                    } else if (hotspot.getAvgDurationMs() > sla.getHighDurationMs()) {
-                        violations.add(SLAViolation.builder()
-                                .type("SLOW_METHOD")
-                                .severity("HIGH")
-                                .actualValue(hotspot.getAvgDurationMs())
-                                .threshold(sla.getHighDurationMs().doubleValue())
-                                .message(String.format("%s exceeds high threshold (%.2fs > %.2fs)",
-                                        getShortMethodName(hotspot.getOperation()),
-                                        hotspot.getAvgDurationMs() / 1000.0,
-                                        sla.getHighDurationMs() / 1000.0))
-                                .build());
-                    }
+            log.info("Found {} hotspots", hotspots.size());
 
-                    if (hotspot.getErrorRate() > sla.getCriticalErrorRate()) {
-                        violations.add(SLAViolation.builder()
-                                .type("HIGH_ERROR_RATE")
-                                .severity("CRITICAL")
-                                .actualValue(hotspot.getErrorRate() * 100)
-                                .threshold(sla.getCriticalErrorRate() * 100)
-                                .message(String.format("%s has %.1f%% error rate",
-                                        getShortMethodName(hotspot.getOperation()),
-                                        hotspot.getErrorRate() * 100))
-                                .build());
-                    }
+            // 4. Build violations based on hotspots
+            List<SLAViolation> violations = new ArrayList<>();
+
+            // Check overall metrics
+            Double avgDuration = (Double) statistics.get("avgDuration");
+            if (avgDuration != null && avgDuration > sla.getCriticalDurationMs()) {
+                violations.add(SLAViolation.builder()
+                        .type("AVG_RESPONSE_TIME")
+                        .severity("CRITICAL")
+                        .actualValue(avgDuration)
+                        .threshold(sla.getCriticalDurationMs().doubleValue())
+                        .message(String.format("Average response time %.2fms exceeds critical threshold %dms",
+                                avgDuration, sla.getCriticalDurationMs()))
+                        .build());
+            }
+
+            // Check individual hotspots
+            for (PerformanceHotspot hotspot : hotspots) {
+                if (hotspot.getAvgDurationMs() > sla.getCriticalDurationMs()) {
+                    violations.add(SLAViolation.builder()
+                            .type("SLOW_METHOD")
+                            .severity("CRITICAL")
+                            .actualValue(hotspot.getAvgDurationMs())
+                            .threshold(sla.getCriticalDurationMs().doubleValue())
+                            .message(String.format("Method averaging %.2fs", hotspot.getAvgDurationMs() / 1000.0))
+                            .build());
+                    break; // Only add one violation for slow methods
                 }
+            }
+
+            // 5. Send alert if hotspots exist and not in cooldown
+            if (!hotspots.isEmpty() && shouldAlert(mapping.getPackageName())) {
 
                 // Get AI analysis for each hotspot
                 Map<String, String> aiAnalysisMap = new HashMap<>();
-                for (PerformanceHotspot hotspot : topHotspots) {
+                for (PerformanceHotspot hotspot : hotspots) {
                     try {
-                        TraceSpan sampleTrace = engine.getSampleTraceForOperation(
-                                hotspot.getOperation(),
-                                mapping.getCloudRoleName(),
-                                mapping.getAlerts().getTimeRange()
-                        );
+                        // Find slowest trace for this operation
+                        TraceSpan slowestTrace = traces.stream()
+                                .filter(t -> t.getOperationName().equals(hotspot.getOperation()))
+                                .max(Comparator.comparing(TraceSpan::getDurationMs))
+                                .orElse(null);
 
-                        if (sampleTrace != null) {
+                        if (slowestTrace != null) {
                             String analysis = llmAnalysisService.analyzeMethodPerformance(
                                     hotspot.getOperation(),
-                                    sampleTrace,
-                                    Collections.singletonList(sampleTrace)
+                                    slowestTrace,
+                                    Collections.singletonList(slowestTrace)
                             );
                             aiAnalysisMap.put(hotspot.getOperation(), analysis);
                             hotspot.setRecommendations(extractRecommendations(analysis));
                         } else {
-                            String defaultAnalysis = generateDefaultAnalysis(hotspot, sla);
-                            aiAnalysisMap.put(hotspot.getOperation(), defaultAnalysis);
                             hotspot.setRecommendations(getDefaultRecommendations(hotspot, sla));
                         }
                     } catch (Exception e) {
@@ -169,10 +165,11 @@ public class TraceBuddyAlertService {
                     }
                 }
 
-                log.info("Sending alert with {} violations", violations.size());
-                sendAlert(mapping, topHotspots, aiAnalysisMap, metrics, violations);
-            } else if (topHotspots.isEmpty()) {
-                log.info("No performance hotspots found");
+                log.info("Sending alert email with {} hotspots", hotspots.size());
+                sendAlert(mapping, hotspots, aiAnalysisMap, statistics, violations);
+
+            } else if (hotspots.isEmpty()) {
+                log.info("No performance issues found");
             } else {
                 log.info("Alert in cooldown period");
             }
@@ -182,31 +179,38 @@ public class TraceBuddyAlertService {
         }
     }
 
+    private List<String> getDefaultRecommendations(PerformanceHotspot hotspot, GitHubProperties.SLAConfig sla) {
+        List<String> recommendations = new ArrayList<>();
+
+        if (hotspot.getAvgDurationMs() > sla.getCriticalDurationMs()) {
+            recommendations.add("Critical performance issue - requires immediate investigation");
+            recommendations.add("Profile the method to identify specific bottlenecks");
+            recommendations.add("Consider implementing caching for frequently accessed data");
+        } else if (hotspot.getAvgDurationMs() > sla.getHighDurationMs()) {
+            recommendations.add("Review and optimize database queries");
+            recommendations.add("Consider adding database indexes");
+            recommendations.add("Evaluate async processing options");
+        }
+
+        if (hotspot.getErrorRate() > sla.getCriticalErrorRate()) {
+            recommendations.add("Implement retry logic with exponential backoff");
+            recommendations.add("Add circuit breaker pattern to prevent cascading failures");
+        }
+
+        if (recommendations.isEmpty()) {
+            recommendations.add("Monitor for performance trends");
+            recommendations.add("Consider profiling during peak load");
+        }
+
+        return recommendations;
+    }
+
     private String getShortMethodName(String fullName) {
         if (fullName == null) return "Unknown";
         int lastDot = fullName.lastIndexOf('.');
         return lastDot > 0 ? fullName.substring(lastDot + 1) : fullName;
     }
 
-    private List<String> getDefaultRecommendations(PerformanceHotspot hotspot, GitHubProperties.SLAConfig sla) {
-        List<String> recommendations = new ArrayList<>();
-
-        if (hotspot.getAvgDurationMs() > sla.getCriticalDurationMs()) {
-            recommendations.add("Critical performance issue - investigate immediately");
-            recommendations.add("Profile method to identify bottlenecks");
-            recommendations.add("Consider implementing caching");
-        } else if (hotspot.getAvgDurationMs() > sla.getHighDurationMs()) {
-            recommendations.add("Review database queries and add indexes if needed");
-            recommendations.add("Consider async processing for non-critical operations");
-        }
-
-        if (hotspot.getErrorRate() > sla.getCriticalErrorRate()) {
-            recommendations.add("Implement retry logic with exponential backoff");
-            recommendations.add("Add circuit breaker pattern");
-        }
-
-        return recommendations;
-    }
 
     private String generateDefaultAnalysis(PerformanceHotspot hotspot, GitHubProperties.SLAConfig sla) {
         StringBuilder analysis = new StringBuilder();

@@ -1318,95 +1318,75 @@ public class AzureMonitorEngine implements TraceMonitorEngine {
             GitHubProperties.SLAConfig slaConfig,
             int topN) {
 
-        StringBuilder query = new StringBuilder();
-        query.append("AppDependencies\n");
-        query.append(String.format("| where TimeGenerated > ago(%s)\n", timeRange));
+        log.info("Getting top slow operations for package: {}", packageName);
 
-        if (cloudRoleName != null && !cloudRoleName.isEmpty()) {
-            query.append(String.format("| where AppRoleName == '%s'\n", cloudRoleName));
-        }
+        // USE THE EXISTING UI METHOD THAT ALREADY WORKS
+        List<TraceSpan> traces = queryTracesWithAllFilters(
+                slaConfig.getHighDurationMs(),  // Minimum duration threshold
+                timeRange,
+                null,  // resourceGroup
+                null,  // instrumentationKey
+                cloudRoleName,
+                null,  // className
+                packageName,
+                true   // includeSubPackages
+        );
 
-        if (packageName != null && !packageName.isEmpty()) {
-            query.append(String.format("| where Name startswith '%s.'\n", packageName)); // WITH DOT
-        }
+        log.info("Found {} traces above threshold", traces.size());
 
-        // Same filters as UI
-        query.append("| where Name !startswith 'GET /'\n");
-        query.append("| where Name !startswith 'POST /'\n");
-        query.append("| where Name !startswith 'PUT /'\n");
-        query.append("| where Name !startswith 'DELETE /'\n");
-        query.append("| where Name !startswith 'HTTP'\n");
-        query.append("| where (Name contains 'com.' or Name contains 'org.' or Name contains 'net.' or Name contains 'io.')\n");
+        // Group by operation name and calculate stats - SAME AS UI
+        Map<String, List<TraceSpan>> tracesByOperation = traces.stream()
+                .collect(Collectors.groupingBy(TraceSpan::getOperationName));
 
-        query.append(String.format("""
-    | summarize 
-        AvgDuration = avg(todouble(DurationMs)),
-        MaxDuration = max(todouble(DurationMs)),
-        Count = count(),
-        ErrorCount = countif(Success == "False")
-        by Name
-    | extend ErrorRate = todouble(ErrorCount) / todouble(Count)
-    | where AvgDuration > %d or ErrorRate > %f
-    | order by AvgDuration desc
-    """,
-                slaConfig.getHighDurationMs(),  // Only return operations exceeding thresholds
-                slaConfig.getHighErrorRate()
-        ));
+        List<PerformanceHotspot> hotspots = new ArrayList<>();
 
-        log.info("Executing top operations query:\n{}", query.toString());
+        for (Map.Entry<String, List<TraceSpan>> entry : tracesByOperation.entrySet()) {
+            String operation = entry.getKey();
+            List<TraceSpan> operationTraces = entry.getValue();
 
-        try {
-            QueryTimeInterval interval = parseTimeRange(timeRange);
-            LogsQueryResult result = logsQueryClient.queryWorkspace(
-                    workspaceId,
-                    query.toString(),
-                    interval
-            );
+            // Calculate stats for this operation
+            DoubleSummaryStatistics stats = operationTraces.stream()
+                    .mapToDouble(TraceSpan::getDurationMs)
+                    .summaryStatistics();
 
-            List<PerformanceHotspot> hotspots = new ArrayList<>();
+            // Count errors
+            long errorCount = operationTraces.stream()
+                    .filter(t -> "False".equalsIgnoreCase(String.valueOf(t.getAttributes().get("success"))))
+                    .count();
 
-            if (result.getAllTables() != null && !result.getAllTables().isEmpty()) {
-                LogsTable table = result.getAllTables().get(0);
+            double errorRate = operationTraces.isEmpty() ? 0.0 : (double) errorCount / operationTraces.size();
 
-                log.info("Got {} rows from top operations query", table.getRows().size());
-
-                for (LogsTableRow row : table.getRows()) {
-                    List<LogsTableCell> cells = row.getRow();
-
-                    // Parse in the correct order based on query
-                    String operationName = getCellStringValue(cells, 0); // Name
-                    Double avgDuration = getCellDoubleValue(cells, 1);   // AvgDuration
-                    Double maxDuration = getCellDoubleValue(cells, 2);   // MaxDuration
-                    Long count = getCellLongValue(cells, 3);            // Count
-                    Long errorCount = getCellLongValue(cells, 4);        // ErrorCount
-                    Double errorRate = getCellDoubleValue(cells, 5);     // ErrorRate
-
-                    // Match UI severity logic
-                    String severity = determineSeverity(avgDuration, errorRate, slaConfig);
-
-
-                    PerformanceHotspot hotspot = PerformanceHotspot.builder()
-                            .operation(operationName)
-                            .avgDurationMs(avgDuration != null ? avgDuration : 0.0)
-                            .maxDurationMs(maxDuration != null ? maxDuration : 0.0)
-                            .occurrenceCount(count != null ? count.intValue() : 0)
-                            .errorRate(errorRate != null ? errorRate : 0.0)
-                            .severity(severity)
-                            .build();
-
-                    hotspots.add(hotspot);
-                    log.info("Added hotspot: {} (Avg: {}ms, Count: {})",
-                            operationName, avgDuration, count);
-                }
+            // Determine severity using SLA config
+            String severity = "MEDIUM";
+            if (stats.getAverage() > slaConfig.getCriticalDurationMs()) {
+                severity = "CRITICAL";
+            } else if (stats.getAverage() > slaConfig.getHighDurationMs()) {
+                severity = "HIGH";
             }
 
-            log.info("Returning {} hotspots", hotspots.size());
-            return hotspots;
+            PerformanceHotspot hotspot = PerformanceHotspot.builder()
+                    .operation(operation)
+                    .avgDurationMs(stats.getAverage())
+                    .maxDurationMs(stats.getMax())
+                    .occurrenceCount(operationTraces.size())
+                    .errorRate(errorRate)
+                    .severity(severity)
+                    .build();
 
-        } catch (Exception e) {
-            log.error("Error querying top slow operations", e);
-            return new ArrayList<>();
+            hotspots.add(hotspot);
+
+            log.info("Hotspot: {} - Avg: {}ms, Max: {}ms, Count: {}",
+                    operation, stats.getAverage(), stats.getMax(), operationTraces.size());
         }
+
+        // Sort by average duration descending and limit if needed
+        List<PerformanceHotspot> sortedHotspots = hotspots.stream()
+                .sorted((a, b) -> Double.compare(b.getAvgDurationMs(), a.getAvgDurationMs()))
+                .limit(topN > 0 ? topN : Integer.MAX_VALUE)
+                .collect(Collectors.toList());
+
+        log.info("Returning {} hotspots", sortedHotspots.size());
+        return sortedHotspots;
     }
 
     @Override
